@@ -57,6 +57,7 @@ use indexer::scheduler::{UnindexedCollabTask, UnindexedData};
 use prost::Message as ProstMessage;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use shared_entity::dto::publish_dto::DuplicatePublishedPageResponse;
 use shared_entity::dto::workspace_dto::*;
 use shared_entity::response::AppResponseError;
 use shared_entity::response::{AppResponse, JsonAppResponse};
@@ -452,6 +453,7 @@ async fn post_workspace_invite_handler(
     &workspace_id,
     invitations,
     state.config.appflowy_web_url.as_deref(),
+    &state.config.admin_frontend_path_prefix,
   )
   .await?;
   Ok(AppResponse::Ok().into())
@@ -1299,6 +1301,8 @@ async fn publish_page_handler(
   let PublishPageParams {
     publish_name,
     visible_database_view_ids,
+    comments_enabled,
+    duplicate_enabled,
   } = payload.into_inner();
   publish_page(
     &state.pg_pool,
@@ -1310,6 +1314,8 @@ async fn publish_page_handler(
     &view_id,
     visible_database_view_ids,
     publish_name,
+    comments_enabled.unwrap_or(true),
+    duplicate_enabled.unwrap_or(true),
   )
   .await?;
   Ok(Json(AppResponse::Ok()))
@@ -1781,25 +1787,30 @@ async fn post_published_duplicate_handler(
   workspace_id: web::Path<String>,
   state: Data<AppState>,
   params: Json<PublishedDuplicate>,
-) -> Result<Json<AppResponse<()>>> {
+) -> Result<Json<AppResponse<DuplicatePublishedPageResponse>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   state
     .workspace_access_control
     .enforce_action(&uid, &workspace_id.to_string(), Action::Write)
     .await?;
   let params = params.into_inner();
-  biz::workspace::publish_dup::duplicate_published_collab_to_workspace(
-    &state.pg_pool,
-    state.bucket_client.clone(),
-    state.collab_access_control_storage.clone(),
-    uid,
-    params.published_view_id,
-    workspace_id.into_inner(),
-    params.dest_view_id,
-  )
-  .await?;
+  let root_view_id_for_duplicate =
+    biz::workspace::publish_dup::duplicate_published_collab_to_workspace(
+      &state.pg_pool,
+      state.bucket_client.clone(),
+      state.collab_access_control_storage.clone(),
+      uid,
+      params.published_view_id,
+      workspace_id.into_inner(),
+      params.dest_view_id,
+    )
+    .await?;
 
-  Ok(Json(AppResponse::Ok()))
+  Ok(Json(AppResponse::Ok().with_data(
+    DuplicatePublishedPageResponse {
+      view_id: root_view_id_for_duplicate,
+    },
+  )))
 }
 
 async fn list_published_collab_info_handler(
@@ -1930,6 +1941,9 @@ async fn delete_published_collab_reaction_handler(
   Ok(Json(AppResponse::Ok()))
 }
 
+// FIXME: This endpoint currently has a different behaviour from the publish page endpoint,
+// as it doesn't accept parameters. We will need to deprecate this endpoint and use a new
+// one that accepts parameters.
 async fn post_publish_collabs_handler(
   workspace_id: web::Path<Uuid>,
   user_uuid: UserUuid,
@@ -1968,7 +1982,14 @@ async fn post_publish_collabs_handler(
       data_buffer
     };
 
-    accumulator.push(PublishCollabItem { meta, data });
+    // Set comments_enabled and duplicate_enabled to true by default, as this is the default
+    // behaviour for the older web version.
+    accumulator.push(PublishCollabItem {
+      meta,
+      data,
+      comments_enabled: true,
+      duplicate_enabled: true,
+    });
   }
 
   if accumulator.is_empty() {

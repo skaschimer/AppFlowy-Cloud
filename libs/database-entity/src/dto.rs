@@ -437,6 +437,18 @@ pub struct PublishInfo {
   pub publish_timestamp: DateTime<Utc>,
   #[serde(default)]
   pub unpublished_timestamp: Option<DateTime<Utc>>,
+  #[serde(default = "default_comments_enabled")]
+  pub comments_enabled: bool,
+  #[serde(default = "default_duplicate_enabled")]
+  pub duplicate_enabled: bool,
+}
+
+fn default_comments_enabled() -> bool {
+  true
+}
+
+fn default_duplicate_enabled() -> bool {
+  true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -801,12 +813,16 @@ pub struct PublishCollabKey {
 pub struct PublishCollabItem<Meta, Data> {
   pub meta: PublishCollabMetadata<Meta>,
   pub data: Data,
+  pub comments_enabled: bool,
+  pub duplicate_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PatchPublishedCollab {
   pub view_id: Uuid,
   pub publish_name: Option<String>,
+  pub comments_enabled: Option<bool>,
+  pub duplicate_enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

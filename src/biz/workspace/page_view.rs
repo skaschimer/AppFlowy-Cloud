@@ -1,5 +1,6 @@
 use crate::api::metrics::AppFlowyWebMetrics;
 use crate::api::ws::RealtimeServerAddr;
+use crate::biz::chat::ops::create_chat;
 use crate::biz::collab::folder_view::{
   check_if_view_is_space, parse_extra_field_as_json, to_dto_view_icon, to_dto_view_layout,
   to_folder_view_icon, to_space_permission,
@@ -49,6 +50,7 @@ use fancy_regex::Regex;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::json;
+use shared_entity::dto::chat_dto::CreateChatParams;
 use shared_entity::dto::publish_dto::{PublishDatabaseData, PublishViewInfo, PublishViewMetaData};
 use shared_entity::dto::workspace_dto::{
   FolderView, Page, PageCollab, PageCollabData, Space, SpacePermission, ViewIcon, ViewLayout,
@@ -218,10 +220,19 @@ pub async fn create_page(
       )
       .await
     },
-    layout => Err(AppError::InvalidRequest(format!(
-      "The layout type {} is not supported for page creation",
-      layout
-    ))),
+    ViewLayout::Chat => {
+      create_chat_page(
+        appflowy_web_metrics,
+        server,
+        user,
+        pg_pool,
+        collab_storage,
+        workspace_id,
+        parent_view_id,
+        name,
+      )
+      .await
+    },
   }
 }
 
@@ -884,6 +895,77 @@ async fn create_database_page(
   })
 }
 
+async fn get_rag_ids(folder: &Folder, parent_view_id: &str) -> Vec<String> {
+  if let Some(view) = folder.get_view(parent_view_id) {
+    if view.space_info().is_some() {
+      return vec![];
+    }
+  };
+  let trash_ids: HashSet<String> = folder
+    .get_all_trash_sections()
+    .iter()
+    .map(|s| s.id.clone())
+    .collect();
+  let mut rag_ids: Vec<String> = folder
+    .get_views_belong_to(parent_view_id)
+    .iter()
+    .filter(|v| v.layout.is_document() && !trash_ids.contains(&v.id))
+    .map(|v| v.id.clone())
+    .collect();
+  rag_ids.push(parent_view_id.to_string());
+  rag_ids
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_chat_page(
+  appflowy_web_metrics: &AppFlowyWebMetrics,
+  server: Data<RealtimeServerAddr>,
+  user: RealtimeUser,
+  pg_pool: &PgPool,
+  collab_storage: &CollabAccessControlStorage,
+  workspace_id: Uuid,
+  parent_view_id: &str,
+  name: Option<&str>,
+) -> Result<Page, AppError> {
+  let view_id = Uuid::new_v4().to_string();
+  let collab_origin = GetCollabOrigin::User { uid: user.uid };
+  let mut folder = get_latest_collab_folder(
+    collab_storage,
+    collab_origin.clone(),
+    &workspace_id.to_string(),
+  )
+  .await?;
+  let rag_ids = get_rag_ids(&folder, parent_view_id).await;
+  create_chat(
+    pg_pool,
+    CreateChatParams {
+      chat_id: view_id.clone(),
+      name: name.unwrap_or_default().to_string(),
+      rag_ids,
+    },
+    &workspace_id.to_string(),
+  )
+  .await?;
+  let folder_update = add_new_view_to_folder(
+    user.uid,
+    parent_view_id,
+    &view_id,
+    &mut folder,
+    name,
+    collab_folder::ViewLayout::Chat,
+  )
+  .await?;
+  update_workspace_folder_data(
+    appflowy_web_metrics,
+    server.clone(),
+    user.clone(),
+    workspace_id,
+    folder_update,
+  )
+  .await?;
+  Ok(Page { view_id })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn move_page(
   appflowy_web_metrics: &AppFlowyWebMetrics,
@@ -1076,6 +1158,8 @@ pub async fn publish_page(
   view_id: &str,
   visible_database_view_ids: Option<Vec<String>>,
   publish_name: Option<impl ToString>,
+  comments_enabled: bool,
+  duplicate_enabled: bool,
 ) -> Result<(), AppError> {
   let folder = get_latest_collab_folder(
     collab_access_control_storage,
@@ -1145,6 +1229,8 @@ pub async fn publish_page(
           metadata: serde_json::value::to_value(metadata).unwrap(),
         },
         data: publish_data,
+        comments_enabled,
+        duplicate_enabled,
       }],
       &workspace_id,
       &user_uuid,
@@ -1286,14 +1372,22 @@ pub async fn get_page_view_collab(
     )))?;
 
   let owner = match view.created_by {
-    Some(uid) => Some(select_web_user_from_uid(pg_pool, uid).await?),
+    Some(uid) => select_web_user_from_uid(pg_pool, uid).await?,
     None => None,
   };
   let last_editor = match view.last_edited_by {
-    Some(uid) => Some(select_web_user_from_uid(pg_pool, uid).await?),
+    Some(uid) => select_web_user_from_uid(pg_pool, uid).await?,
     None => None,
   };
-  let publish_view_ids = select_published_view_ids_for_workspace(pg_pool, workspace_id).await?;
+  let publish_view_ids = select_published_view_ids_for_workspace(pg_pool, workspace_id)
+    .await
+    .map_err(|err| {
+      AppError::Internal(anyhow::anyhow!(
+        "Unable to obtain published view id for workspace {}: {}",
+        workspace_id,
+        err
+      ))
+    })?;
   let publish_view_ids: HashSet<String> = publish_view_ids
     .into_iter()
     .map(|id| id.to_string())
@@ -1353,7 +1447,15 @@ async fn get_page_collab_data_for_database(
   workspace_id: Uuid,
   view_id: &str,
 ) -> Result<PageCollabData, AppError> {
-  let ws_db_oid = select_workspace_database_oid(pg_pool, &workspace_id).await?;
+  let ws_db_oid = select_workspace_database_oid(pg_pool, &workspace_id)
+    .await
+    .map_err(|err| {
+      AppError::Internal(anyhow::anyhow!(
+        "Unable to find workspace database oid for {}: {}",
+        workspace_id,
+        err
+      ))
+    })?;
   let ws_db = get_latest_collab_encoded(
     collab_access_control_storage,
     GetCollabOrigin::User { uid },
@@ -1361,8 +1463,22 @@ async fn get_page_collab_data_for_database(
     &ws_db_oid,
     CollabType::WorkspaceDatabase,
   )
-  .await?;
-  let ws_db_collab = collab_from_doc_state(ws_db.doc_state.to_vec(), &ws_db_oid)?;
+  .await
+  .map_err(|err| {
+    AppError::Internal(anyhow::anyhow!(
+      "Unable to get latest workspace database collab {}: {}",
+      &ws_db_oid,
+      err
+    ))
+  })?;
+  let ws_db_collab =
+    collab_from_doc_state(ws_db.doc_state.to_vec(), &ws_db_oid).map_err(|err| {
+      AppError::Internal(anyhow::anyhow!(
+        "Unable to decode workspace database collab {}: {}",
+        &ws_db_oid,
+        err
+      ))
+    })?;
   let ws_db_body = WorkspaceDatabase::open(ws_db_collab).map_err(|err| {
     AppError::Internal(anyhow!("Failed to open workspace database body: {}", err))
   })?;
@@ -1382,7 +1498,14 @@ async fn get_page_collab_data_for_database(
     &db_oid,
     CollabType::Database,
   )
-  .await?;
+  .await
+  .map_err(|err| {
+    AppError::Internal(anyhow::anyhow!(
+      "Unable to get latest database collab {}: {}",
+      &db_oid,
+      err
+    ))
+  })?;
   let db_collab = Collab::new_with_source(
     CollabOrigin::Server,
     &db_oid,
@@ -1448,7 +1571,14 @@ async fn get_page_collab_data_for_database(
       .collect();
     row_collabs
   })
-  .await?;
+  .await
+  .map_err(|err| {
+    AppError::Internal(anyhow::anyhow!(
+      "Unable to get row data for database {}: {}",
+      &db_oid,
+      err
+    ))
+  })?;
 
   Ok(PageCollabData {
     encoded_collab: db.doc_state.to_vec(),
@@ -1469,7 +1599,14 @@ async fn get_page_collab_data_for_document(
     view_id,
     CollabType::Document,
   )
-  .await?;
+  .await
+  .map_err(|err| {
+    AppError::Internal(anyhow::anyhow!(
+      "Unable to get page collab data for {}: {}",
+      view_id,
+      err
+    ))
+  })?;
   Ok(PageCollabData {
     encoded_collab: collab.doc_state.clone().to_vec(),
     row_data: HashMap::default(),

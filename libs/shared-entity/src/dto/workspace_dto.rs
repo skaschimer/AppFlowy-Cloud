@@ -285,6 +285,8 @@ pub struct PublishInfoView {
 pub struct PublishPageParams {
   pub publish_name: Option<String>,
   pub visible_database_view_ids: Option<Vec<String>>,
+  pub comments_enabled: Option<bool>,
+  pub duplicate_enabled: Option<bool>,
 }
 
 #[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize_repr, Deserialize_repr)]
@@ -389,9 +391,20 @@ pub struct PublishedView {
   pub icon: Option<ViewIcon>,
   pub layout: ViewLayout,
   pub is_published: bool,
+  #[serde(flatten)]
+  pub info: Option<PublishedViewInfo>,
   /// contains fields like `is_space`, and font information
   pub extra: Option<serde_json::Value>,
   pub children: Vec<PublishedView>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedViewInfo {
+  pub publisher_email: String,
+  pub publish_name: String,
+  pub publish_timestamp: DateTime<Utc>,
+  pub comments_enabled: bool,
+  pub duplicate_enabled: bool,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
